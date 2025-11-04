@@ -5,6 +5,7 @@ import time
 import subprocess
 import re
 import struct
+import os
 from typing import Dict, List, Tuple
 
 class LocalNetworkDevice:
@@ -17,11 +18,6 @@ class LocalNetworkDevice:
         self.running = False
         self.device_name = socket.gethostname()
         self.device_id = f"{self.device_name}_{int(time.time())}"
-        self.message_callback = None  # Callback for received messages
-    
-    def set_message_callback(self, callback):
-        """Set callback function for received messages"""
-        self.message_callback = callback
         
     def get_local_ip(self) -> str:
         """Get the local IP address"""
@@ -222,22 +218,191 @@ class LocalNetworkDevice:
                 
             elif message['type'] == 'data':
                 # Handle incoming data
-                sender_name = message.get('sender', f'Device-{address[0]}')
-                payload = message['payload']
-                
-                print(f"Received data from {address[0]}: {payload}")
-                
-                # Call the callback if it's set (for GUI integration)
-                if self.message_callback:
-                    self.message_callback(address[0], sender_name, payload)
-                
+                print(f"📨 Received data from {address[0]}: {message['payload']}")
                 response = {'type': 'ack', 'status': 'received'}
                 client_socket.send(json.dumps(response).encode('utf-8'))
                 
+            elif message['type'] == 'file_transfer_request':
+                # Handle file transfer request
+                filename = message['filename']
+                sender = message['sender']
+                file_size = message['file_size']
+                
+                print(f"📤 {sender} wants to send file: {filename} ({file_size} bytes)")
+                
+                # Optimize socket for file transfer
+                client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+                client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+                
+                # Auto-accept for now (could add user prompt later)
+                accept_response = {'status': 'accepted'}
+                client_socket.send(json.dumps(accept_response).encode('utf-8'))
+                
+                # Receive the file
+                self.receive_file(client_socket, address, filename, file_size)
+                
         except Exception as e:
-            print(f"Error handling client {address}: {e}")
+            print(f"❌ Error handling client {address}: {e}")
         finally:
             client_socket.close()
+    
+    def send_file(self, target_ip: str, filename: str) -> bool:
+        """Send a file to another device"""
+        if not os.path.exists(filename):
+            print(f"File not found: {filename}")
+            return False
+        
+        if not os.path.isfile(filename):
+            print(f"Not a file: {filename}")
+            return False
+        
+        try:
+            print(f"Initiating file transfer of {filename} to {target_ip}")
+            
+            # Create a new socket for file transfer
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # Disable Nagle's algorithm
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)  # 64KB send buffer
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)  # 64KB receive buffer
+            sock.settimeout(10)
+            sock.connect((target_ip, self.port))
+            
+            # Send file transfer request
+            file_size = os.path.getsize(filename)
+            request = {
+                'type': 'file_transfer_request',
+                'filename': os.path.basename(filename),
+                'sender': self.device_name,
+                'file_size': file_size
+            }
+            
+            request_json = json.dumps(request)
+            sock.send(request_json.encode('utf-8'))
+            
+            # Wait for acceptance
+            response = sock.recv(1024).decode('utf-8')
+            ack = json.loads(response)
+            
+            if ack.get('status') != 'accepted':
+                reason = ack.get('reason', 'Unknown reason')
+                print(f"File transfer rejected by recipient: {reason}")
+                sock.close()
+                return False
+            
+            print("Recipient accepted file transfer, starting upload...")
+            
+            # Send the file
+            success = self._send_file_data(sock, filename)
+            sock.close()
+            
+            if success:
+                print(f"✅ File {filename} sent successfully!")
+            return success
+            
+        except Exception as e:
+            print(f"❌ Error sending file {filename} to {target_ip}: {e}")
+            return False
+    
+    def _send_file_data(self, sock: socket.socket, filename: str) -> bool:
+        """Send file data with progress tracking"""
+        try:
+            file_size = os.path.getsize(filename)
+            sent_bytes = 0
+            
+            with open(filename, 'rb') as f:
+                while True:
+                    chunk = f.read(65536)  # 64KB chunks for faster transfer
+                    if not chunk:
+                        break
+                    
+                    # Send chunk size first
+                    chunk_size = len(chunk)
+                    sock.send(struct.pack('!I', chunk_size))
+                    
+                    # Send chunk data
+                    sock.send(chunk)
+                    
+                    sent_bytes += chunk_size
+                    
+                    # Show progress (update every 1MB or every 10 chunks)
+                    if sent_bytes % (1024 * 1024) < chunk_size or sent_bytes == chunk_size:
+                        progress = (sent_bytes / file_size) * 100
+                        print(f"📤 Uploading {os.path.basename(filename)}: {progress:.1f}% ({sent_bytes}/{file_size} bytes)", end='\r')
+                    
+                    # Wait for acknowledgment (simple 1-byte ack)
+                    ack = sock.recv(1)
+                    if ack != b'\x01':
+                        print(f"❌ Error: Bad acknowledgment received")
+                        return False
+            
+            print(f"📤 Uploading {os.path.basename(filename)}: 100.0% ({file_size}/{file_size} bytes)")
+            
+            # Send end marker (0 size indicates end of file)
+            sock.send(struct.pack('!I', 0))
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error during file upload: {e}")
+            return False
+    
+    def receive_file(self, client_socket: socket.socket, address: Tuple[str, int], filename: str, file_size: int):
+        """Receive a file from a sender"""
+        try:
+            print(f"📥 Receiving file: {filename} ({file_size} bytes)")
+            
+            # Create downloads directory if it doesn't exist
+            os.makedirs('downloads', exist_ok=True)
+            
+            # Save with timestamp to avoid conflicts
+            base, ext = os.path.splitext(filename)
+            timestamp = int(time.time())
+            save_path = f"downloads/{base}_{timestamp}{ext}"
+            
+            received_bytes = 0
+            
+            with open(save_path, 'wb') as f:
+                while True:
+                    # Receive chunk size
+                    chunk_size_data = client_socket.recv(4)
+                    if len(chunk_size_data) != 4:
+                        print("❌ Error: Incomplete chunk size data")
+                        return False
+                    
+                    chunk_size = struct.unpack('!I', chunk_size_data)[0]
+                    
+                    if chunk_size == 0:
+                        # End of file
+                        break
+                    
+                    # Receive chunk data
+                    chunk = b''
+                    while len(chunk) < chunk_size:
+                        data = client_socket.recv(chunk_size - len(chunk))
+                        if not data:
+                            print("❌ Error: Connection closed during file transfer")
+                            return False
+                        chunk += data
+                    
+                    f.write(chunk)
+                    received_bytes += chunk_size
+                    
+                    # Show progress (update every 1MB or every 10 chunks)
+                    if received_bytes % (1024 * 1024) < chunk_size or received_bytes == chunk_size:
+                        progress = (received_bytes / file_size) * 100
+                        print(f"📥 Receiving {filename}: {progress:.1f}% ({received_bytes}/{file_size} bytes)", end='\r')
+                    
+                    # Send acknowledgment
+                    client_socket.send(b'\x01')
+            
+            print(f"📥 Receiving {filename}: 100.0% ({file_size}/{file_size} bytes)")
+            print(f"✅ File saved as: {save_path}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error receiving file: {e}")
+            return False
     
     def discover_devices(self) -> Dict[str, dict]:
         """Discover devices on the network using multiple methods"""
@@ -377,10 +542,11 @@ def main():
         print("2. List discovered devices")
         print("3. Send data to specific device")
         print("4. Broadcast data to all devices")
-        print("5. Show network info")
-        print("6. Exit")
+        print("5. Send file to specific device")
+        print("6. Show network info")
+        print("7. Exit")
         
-        choice = input("\nEnter your choice (1-6): ").strip()
+        choice = input("\nEnter your choice (1-7): ").strip()
         
         if choice == '1':
             devices = device.discover_devices()
@@ -427,6 +593,30 @@ def main():
             device.broadcast_data(data)
         
         elif choice == '5':
+            app_devices = {ip: info for ip, info in device.devices.items() if info.get('port')}
+            if not app_devices:
+                print("No devices running our application. Discover devices first.")
+                continue
+                
+            print("Devices running our application:")
+            ips = list(app_devices.keys())
+            for i, (ip, info) in enumerate(app_devices.items()):
+                print(f"  {i+1}. {info['name']} ({ip})")
+            
+            try:
+                idx = int(input("Select device (number): ")) - 1
+                if 0 <= idx < len(ips):
+                    target_ip = ips[idx]
+                    filename = input("Enter filename to send: ")
+                    success = device.send_file(target_ip, filename)
+                    if not success:
+                        print("Failed to send file.")
+                else:
+                    print("Invalid selection.")
+            except ValueError:
+                print("Invalid input.")
+        
+        elif choice == '6':
             print(f"\nNetwork Information:")
             print(f"Local IP: {device.get_local_ip()}")
             print(f"Broadcast Address: {device.get_broadcast_address()}")
@@ -435,7 +625,7 @@ def main():
             print(f"Device Name: {device.device_name}")
             print(f"Device ID: {device.device_id}")
         
-        elif choice == '6':
+        elif choice == '7':
             print("Stopping...")
             device.stop()
             break
