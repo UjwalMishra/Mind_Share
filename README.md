@@ -14,14 +14,6 @@
 - [🧰 Tech Stack](#-tech-stack)
 - [🧪 Use Cases](#-use-cases)
 - [⚡ Future Enhancements](#-future-enhancements)
-- [🏁 Getting Started](#-getting-started)
-- [🧩 Project Structure](#-project-structure)
-- [⚙️ Setup & Installation](#️-setup--installation)
-- [🧠 Network Overview Diagram](#-network-overview-diagram)
-- [🛠 Developer Notes](#-developer-notes)
-- [🤝 Team](#-team)
-- [🪪 License](#-license)
-- [📞 Contact](#-contact)
 
 ---
 
